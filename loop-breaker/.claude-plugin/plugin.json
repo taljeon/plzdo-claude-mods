@@ -1,0 +1,23 @@
+{
+  "name": "loop-breaker",
+  "version": "0.1.1-ta.1",
+  "description": "같은 명령이 계속 실패하거나 같은 코드를 반복해서 고치면 Claude에게 멈추고 다시 생각하라고 알려줍니다. Fork of mishgoldenberg/claude-mods (MIT).",
+  "author": {
+    "name": "Michael Goldenberg",
+    "url": "https://github.com/mishgoldenberg"
+  },
+  "userConfig": {
+    "failLimit": {
+      "type": "number",
+      "title": "같은 명령 연속 실패 한도",
+      "description": "같은 셸 명령이 이 횟수만큼 연속 실패하면 알립니다.",
+      "default": 3
+    },
+    "editLimit": {
+      "type": "number",
+      "title": "한 턴에 같은 코드 재수정 한도",
+      "description": "이번 턴에 이미 고친 코드를 이 횟수만큼 다시 고치면 알립니다 (파일의 다른 부분을 따로 고치는 건 세지 않음).",
+      "default": 3
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "next-steps-pick",
+  "version": "0.1.0",
+  "description": "Next-step suggestions above the prompt; pressing one puts it in the prompt box. Fork of inline-next-steps by Shijie Li (MIT).",
+  "author": {
+    "name": "Shijie Li"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/shijieli708-ship-it/claude-mods",
+  "repository": "https://github.com/shijieli708-ship-it/claude-mods",
+  "types": "./types/index.d.ts"
+}

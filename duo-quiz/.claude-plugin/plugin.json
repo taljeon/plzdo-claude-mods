@@ -1,0 +1,8 @@
+{
+  "name": "duo-quiz",
+  "version": "0.1.4",
+  "description": "Korean coding quizzes below the workbench pane, with feedback and one retry for missed questions.",
+  "author": { "name": "taljeon", "url": "https://github.com/taljeon" },
+  "dependencies": ["workbench"],
+  "types": "./types/index.d.ts"
+}

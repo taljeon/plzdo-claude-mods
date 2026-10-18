@@ -1,0 +1,56 @@
+# Defaults are applied before the exported commit's .releaseignore.
+# To ship only root agent skills, append these overrides to .releaseignore:
+# !/.claude/
+# /.claude/*
+# !/.claude/skills/
+# To publish only the root AGENTS.md, append: !/AGENTS.md
+
+# Agent configuration at any depth
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+.claude/
+.codex/
+.cursor/
+.gemini/
+.windsurf/
+.aider*
+.cursorrules
+.windsurfrules
+.clinerules
+.mcp.json
+.mcp.local.json
+**/.github/copilot-instructions.md
+**/.github/instructions/
+**/.github/prompts/
+**/.github/agents/
+
+# Root-only agent work areas
+/TASKS.md
+/TASKS/
+/.agent-work/
+/.scratch/
+/.notes/
+
+# Secrets (examples require an explicit project override)
+.env*
+.direnv/
+.netrc
+.pypirc
+*.pem
+*.key
+
+# Editor and OS files
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Release selection rules
+/.releaseignore
+/.releasescan-allow

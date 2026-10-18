@@ -1,0 +1,25 @@
+{
+  "name": "blast-radius",
+  "version": "0.3.0-ta.4",
+  "description": "Holds risky Bash commands, secret file access, and rm/mv or file-tool writes outside the project, showing secrets, repos, uncommitted work and file dates before they run. Fork of hamzafer/claude-code-mods.",
+  "author": {
+    "name": "Hamza Zafar",
+    "url": "https://github.com/hamzafer"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "trustedFolders": {
+      "type": "string",
+      "title": "Trusted folders (writes)",
+      "description": "Comma-separated folders. Writes there run without a hold; deletes and secret files are still held.",
+      "default": "~/.claude, ~/.codex, ~/.agents"
+    },
+    "timeoutSeconds": {
+      "type": "number",
+      "title": "Auto-cancel after (seconds)",
+      "description": "How long a held command waits for Cancel or Proceed before it is cancelled. 0 waits forever.",
+      "default": 60,
+      "min": 0
+    }
+  }
+}

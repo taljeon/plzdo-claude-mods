@@ -1,0 +1,8 @@
+{
+  "name": "workbench",
+  "version": "0.5.1",
+  "description": "Side pane: changed files with diff, stage, open in VS Code, why/review asks, running tool calls, pinned decisions, agent and Codex run status, blast-radius approvals, and permission dialog answers",
+  "author": { "name": "taljeon", "url": "https://github.com/taljeon" },
+  "dependencies": ["blast-radius"],
+  "types": "./types/index.d.ts"
+}

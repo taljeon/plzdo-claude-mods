@@ -1,0 +1,16 @@
+{
+  "name": "usage-keeper",
+  "version": "0.3.2",
+  "description": "Usage band, idle keep-alives followed by handoff (fixed sections plus git state) before the prompt cache lapses, and a ping when the 5-hour window resets",
+  "author": { "name": "taljeon", "url": "https://github.com/taljeon" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "keepAlives": {
+      "type": "number",
+      "title": "Keep-alive messages before handoff",
+      "description": "How many 55-minute idle keep-alive messages to send before compacting. 0 compacts at the first idle deadline.",
+      "default": 3,
+      "min": 0
+    }
+  }
+}
