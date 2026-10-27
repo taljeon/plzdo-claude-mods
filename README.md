@@ -8,34 +8,35 @@ Personal Claude Code mods. Each folder is one mod.
 - `workbench`: a side pane with the changed files, their diff, stage and open-in-VS Code buttons, the status of running agents and Codex, and the first line of each Codex run's last answer; settings ask-rule requests wait in a placed pane for approval or refusal for 30 s, then fall back to the chat dialog, with the tool, agent, input, and rule shown.
 - `loop-breaker`: tells Claude to stop and rethink when the same command keeps failing or the same code keeps being rewritten. Fork of mishgoldenberg/claude-mods (MIT), messages in Korean.
 - `md-render`: redraws Claude's finished replies as colored markdown (headings, bold, code, lists, quotes); tables and code blocks keep the built-in renderer. Fork of deepskyblue86/claude-markdown-mod (MIT).
-- `duo-quiz`: Duolingo-style multiple-choice quiz below the workbench pane, made by Haiku from the current prompt and the last answer (architecture, design, terms). Up to 10 questions, explanations, missed ones asked once more at the end, skip and stop. Each quiz is an extra Haiku call, billed like any other model use.
-- `next-steps-pick`: next-step suggestions above the prompt; pressing one puts that request in the prompt box (Enter sends it). Fork of shijieli708-ship-it/claude-mods inline-next-steps (MIT); if you also have `inline-next-steps@claude-mods`, turn it off in `enabledPlugins` (install.py only warns).
+- `duo-quiz`: Duolingo-style multiple-choice quiz below the workbench pane, made by Haiku from the current prompt and the last answer (architecture, design, terms). Up to 10 questions, explanations, missed ones asked once more at the end, skip and stop. Quiz generation is an extra Haiku call, billed like any other model use.
+- `next-steps-pick`: next-step suggestions above the prompt; pressing one puts that request in the prompt box (Enter sends it). Fork of shijieli708-ship-it/claude-mods inline-next-steps (MIT); if you also have `inline-next-steps@claude-mods`, turn it off in `enabledPlugins`.
 
 ## Requirements
 
-- Claude Code with mod support (`CLAUDE_CODE_PLUGIN_DIRS`); tested on 2.1.300.
+- Claude Code with mod support; tested on 2.1.300.
 - macOS or Linux with `bash` and `git` (blast-radius runs its checks through `/bin/bash`).
-- Python 3.9+ for `install.py`; Python 3.12+ for `shared-skills/dev-release-split` (`pytest` only to run its tests).
-- dev-release-split bundles its leak scanner (`scripts/leak_scan.py`); set `git config dev-release.scanner` to use another one (see its SKILL.md).
+- UI strings are in Korean.
 
 ## Use
 
+Clone at a pinned commit, then load the mods you want for a session with `--plugin-dir` (repeatable). Nothing is installed or written to your settings.
+
 ```bash
-git clone https://github.com/taljeon/plzdo-claude-mods.git ~/.claude/mods
-cd ~/.claude/mods
-python3 install.py          # Preview only; no writes
-python3 install.py --apply  # Apply the changes
+git clone https://github.com/taljeon/plzdo-claude-mods.git
+claude --plugin-dir plzdo-claude-mods/blast-radius --plugin-dir plzdo-claude-mods/md-render
+claude --plugin-dir plzdo-claude-mods      # a folder of plugins loads every mod in it
 ```
 
-The installer uses Python 3.9+ and the standard library only.
+`duo-quiz` depends on `workbench`, which depends on `blast-radius`: load all three together.
 
-It discovers this checkout's mods and merges their absolute paths into `env.CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`, preserving existing paths and other settings. Before changing an existing settings file, it creates a `settings.json.bak-YYYYMMDD-HHMMSS` backup (with a numeric suffix if needed). It also symlinks each shared skill into `~/.claude/skills` (except `claude-env-setup`, which is used from the checkout); conflicting paths are reported and left untouched while other changes are applied. Restart Claude Code after applying.
+What runs and what leaves the machine:
 
-Use `--claude-dir PATH` on both commands to target another configuration directory. Without it, the installer uses `$CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude`.
-
-To undo a settings change, copy the appropriate `settings.json.bak-*` file back to `settings.json` in that directory. Backups restore settings only, not skill symlinks; a newly created settings file has no backup.
-
-For guided setup through Claude, use [shared-skills/claude-env-setup](shared-skills/claude-env-setup/SKILL.md).
+- No model calls: `loop-breaker`, `blast-radius`, `md-render`, `next-steps-pick`, `workbench`.
+- `where-am-i`: a Haiku call after every main turn with part of the last prompt, recent tool descriptions and the reply.
+- `duo-quiz`: a Haiku call on each new prompt while no quiz is running, with up to 4,000 characters each of the prompt and the previous answer.
+- `usage-keeper`: sends prompts by itself after 55 idle minutes (only with 20,000+ context tokens), then compacts and writes a handoff under `~/.claude/handoffs`.
+- `loop-breaker` adds a note to the conversation after 3 repeated failures or rewrites; `next-steps-pick` adds about 1,000 characters of instructions to each eligible prompt.
+- Permission decisions: `blast-radius` only returns deny; `workbench` can return allow or deny for settings ask rules you answer in its pane, and reads recent `~/.codex/sessions` files.
 
 ## License
 
