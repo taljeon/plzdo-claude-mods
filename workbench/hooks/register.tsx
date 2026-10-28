@@ -9,6 +9,7 @@ import type { HeldCommand, WaitingCall } from '../../blast-radius/types'
 import type {} from '../../duo-quiz/types'
 import { callSummary, callText, clipDiff, codexState, elapsed, fileLabel, lastMarker, lastResult, metaLabel, parseNumstat, parseStatus } from './parse'
 import type { Marker } from './parse'
+import { DIFF_SCRIPT, NUMSTAT_SCRIPT, SHELL_ARGV, STAGE_SCRIPT, STATUS_SCRIPT, TOP_SCRIPT, UNCHECKED, UNCHECKED_TEXT, UNSTAGE_SCRIPT, UNTRACKED_SCRIPT } from './git'
 
 const PANE = 'workbench'
 const POLL_MS = 4000
@@ -26,6 +27,7 @@ const RULE_WAIT_MS = 30_000
 const files = atom({ plugin: 'workbench', key: 'files' } as const, [] as ChangedFile[])
 const selected = atom({ plugin: 'workbench', key: 'selected' } as const, null as string | null)
 const diff = atom({ plugin: 'workbench', key: 'diff' } as const, '')
+const unchecked = atom({ plugin: 'workbench', key: 'unchecked' } as const, false)
 const repo = atom({ plugin: 'workbench', key: 'repo' } as const, null as string | null)
 const agents = atom({ plugin: 'workbench', key: 'agents' } as const, [] as AgentRow[])
 const codex = atom({ plugin: 'workbench', key: 'codex' } as const, [] as CodexRun[])
@@ -47,6 +49,7 @@ type Engine = EngineInterface
 
 let timer: { cancel: () => void } | undefined
 let isBusy = false
+let pinnedGit: string | undefined
 let mainTurnId: string | undefined
 let mainMode: string | undefined
 // Per rollout file: re-read only when its mtime moved; the state is recomputed from the clock each poll.
@@ -55,23 +58,39 @@ const seen = new Map<string, { mtimeMs: number; marker: Marker; result: string; 
 // started with and never saw a press (seen live), while the button and the hook share this module.
 const pressed = new Map<string, 'allow' | 'deny'>()
 
-const git = (e: Engine, cwd: string, args: string[]) => e.process.run(['git', ...args], { cwd })
+const runGit = (e: Engine, cwd: string, script: string, ...args: string[]) =>
+  e.process.run([...SHELL_ARGV, script, 'workbench-git', ...args], { cwd })
 
 async function refreshFiles($: Engine) {
-  const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'])
+  pinnedGit = undefined
+  const top = await runGit($, await $.session.cwd(), TOP_SCRIPT)
   if (top.exitCode !== 0) {
+    await update($, unchecked, () => top.exitCode === UNCHECKED)
     await update($, repo, () => null)
     await update($, files, () => [])
+    await update($, selected, () => null)
+    await update($, diff, () => '')
     await loadPins($, await $.session.cwd())
     return
   }
-  const root = top.stdout.trim()
+  const [root, binary, ...extra] = top.stdout.trimEnd().split('\n')
+  if (extra.length > 0 || !root?.startsWith('/') || !binary?.startsWith('/')) {
+    await update($, unchecked, () => true)
+    await update($, repo, () => null)
+    await update($, files, () => [])
+    await update($, selected, () => null)
+    await update($, diff, () => '')
+    return
+  }
+  pinnedGit = binary
   const [status, numstat] = await Promise.all([
-    git($, root, ['status', '--porcelain=v1', '-z']),
-    git($, root, ['diff', 'HEAD', '--numstat', '-z']),
+    runGit($, root, STATUS_SCRIPT, binary),
+    runGit($, root, NUMSTAT_SCRIPT, binary),
   ])
-  const counts = parseNumstat(numstat.stdout)
-  const list = parseStatus(status.stdout).map(f => ({ ...f, ...(counts.get(f.path) ?? {}) }))
+  const unsafe = status.exitCode !== 0 || numstat.exitCode !== 0
+  await update($, unchecked, () => unsafe)
+  const counts = parseNumstat(unsafe ? '' : numstat.stdout)
+  const list = parseStatus(unsafe ? '' : status.stdout).map(f => ({ ...f, ...(counts.get(f.path) ?? {}) }))
   await update($, repo, () => root)
   await update($, files, () => list)
   await loadPins($, root)
@@ -85,13 +104,16 @@ async function refreshFiles($: Engine) {
 }
 
 async function loadDiff($: Engine, path: string, root: string, list: ChangedFile[]) {
+  if (!pinnedGit) {
+    await update($, unchecked, () => true)
+    await update($, diff, () => '')
+    return
+  }
   const file = list.find(f => f.path === path)
-  const args =
-    file?.index === '?'
-      ? ['diff', '--no-index', '--', '/dev/null', path]
-      : ['diff', 'HEAD', '--', path]
-  const out = await git($, root, args)
-  await update($, diff, () => out.stdout)
+  const out = await runGit($, root, file?.index === '?' ? UNTRACKED_SCRIPT : DIFF_SCRIPT, pinnedGit, path)
+  const unsafe = out.exitCode === UNCHECKED || (out.exitCode !== 0 && !(file?.index === '?' && out.exitCode === 1))
+  await update($, unchecked, () => unsafe)
+  await update($, diff, () => unsafe ? '' : out.stdout)
 }
 
 // Pins live in the store per repo, so they outlast the session; outside a repo, per working folder.
@@ -188,7 +210,11 @@ async function refresh($: Engine) {
   isBusy = true
   try {
     await Promise.all([
-      refreshFiles($).catch(() => {}),
+      refreshFiles($).catch(async () => {
+        await update($, unchecked, () => true)
+        await update($, files, () => [])
+        await update($, diff, () => '')
+      }),
       refreshAgents($).catch(() => {}),
       refreshCodex($).catch(() => {}),
       // Elapsed times are drawn from the clock: a fresh array redraws them each poll.
@@ -352,7 +378,7 @@ export const register: Register = on => {
       }
     }
     const { Box, Text, Button } = ui
-    const [list, current, patch, root, agentRows, codexRows, calls, pinned, now, heldCall, waitingCalls, permissionEntries] = await Promise.all([
+    const [list, current, patch, root, agentRows, codexRows, calls, pinned, now, heldCall, waitingCalls, permissionEntries, isUnchecked] = await Promise.all([
       read($, files),
       read($, selected),
       read($, diff),
@@ -365,6 +391,7 @@ export const register: Register = on => {
       read($, radiusHeld).catch(() => null),
       read($, radiusWaiting).then(value => value ?? []).catch(() => []),
       read($, permissions),
+      read($, unchecked),
     ])
     // ponytail: time expiry also hides leftovers from a reloaded module.
     const permissionCalls = permissionEntries.filter(call => !pressed.has(call.id) && now < call.at + RULE_WAIT_MS)
@@ -383,8 +410,12 @@ export const register: Register = on => {
     }
     const toggleStage = async () => {
       if (!chosen || !root) return
+      if (!pinnedGit) {
+        await update($, unchecked, () => true)
+        return
+      }
       const isStaged = chosen.index !== ' ' && chosen.index !== '?'
-      await git($, root, isStaged ? ['restore', '--staged', '--', chosen.path] : ['add', '--', chosen.path])
+      await runGit($, root, isStaged ? UNSTAGE_SCRIPT : STAGE_SCRIPT, pinnedGit, chosen.path)
       await refresh($)
     }
     const send = async (text: string) => {
@@ -400,7 +431,8 @@ export const register: Register = on => {
     const missingAgents = allPending.filter((call, index) => call.agentId !== undefined
       && !agentRows.some(agent => agent.id === call.agentId)
       && allPending.findIndex(other => other.agentId === call.agentId) === index)
-    const approve = async (id: string, decision: Approval['decision']) => {
+    const approve = async (call: HeldCommand | WaitingCall, decision: Approval['decision']) => {
+      const id = call.id
       const [currentHeld, currentWaiting, at] = await Promise.all([
         read($, radiusHeld).catch(() => null),
         read($, radiusWaiting).then(value => value ?? []).catch(() => []),
@@ -408,10 +440,16 @@ export const register: Register = on => {
       ])
       const activeIds = new Set(currentWaiting.map(call => call.id))
       if (currentHeld) activeIds.add(currentHeld.id)
+      // Bind the press to the preview that rendered this button, not a newer hold with the same id.
+      const binding = decision === 'proceed' && 'holdId' in call && call.holdId
+        && currentHeld?.id === id && currentHeld.holdId === call.holdId && currentHeld.command === call.command
+        ? { holdId: call.holdId, command: call.command } : undefined
+      if (decision === 'proceed' && !binding) return
       await update($, approvals, entries => [
-        // Kept while listed, or for 10 minutes: a call between waiting and held is in neither list for a moment.
-        ...entries.filter(entry => entry.id !== id && (activeIds.has(entry.id) || at - entry.at < 10 * 60_000)),
-        ...(activeIds.has(id) ? [{ id, decision, at }] : []),
+        // Waiting stays listed until held is published; finished decisions need no grace period.
+        ...entries.filter(entry => entry.id !== id && activeIds.has(entry.id)
+          && (entry.decision === 'cancel' || (entry.holdId === currentHeld?.holdId && entry.command === currentHeld?.command))),
+        ...(activeIds.has(id) ? [{ id, decision, at, ...binding }] : []),
       ].slice(-20))
     }
     const approvalRows = (agentId: string | undefined, readOnly: boolean) => pending
@@ -420,11 +458,14 @@ export const register: Register = on => {
         <Box key={`approval-${call.id}`} flexDirection="column" paddingLeft={1}>
           <Box flexDirection="row">
             <Box flexShrink={1}>
-              <Text color="warning" wrap="wrap">{`승인 대기: ${approvalCommand(call.command)}`}</Text>
+              <Text color="warning" wrap="wrap">{`승인 대기: ${heldCall?.id === call.id ? singleLine(call.command) : approvalCommand(call.command)}`}</Text>
             </Box>
           </Box>
           {heldCall?.id === call.id && (
             <Box flexDirection="column">
+              {(heldCall.highlights ?? []).map((highlight, index) => (
+                <Text key={`highlight-${index}`} color="warning" wrap="wrap">{singleLine(highlight.uiText ?? highlight.text)}</Text>
+              ))}
               {heldCall.secondsLeft !== null && <Text color="warning" wrap="wrap">{`${heldCall.secondsLeft}초 후 자동 취소`}</Text>}
               <Box flexDirection="row">
                 <Box flexShrink={1}>
@@ -435,8 +476,8 @@ export const register: Register = on => {
           )}
           {!readOnly && (
             <Box flexDirection="row" flexWrap="wrap" gap={1}>
-              <Button key={`approval-proceed-${call.id}`} label="진행" onPress={() => approve(call.id, 'proceed')} />
-              <Button key={`approval-cancel-${call.id}`} label="취소" onPress={() => approve(call.id, 'cancel')} />
+              {heldCall?.id === call.id && heldCall.holdId && <Button key={`approval-proceed-${call.id}`} label="진행" onPress={() => approve(call, 'proceed')} />}
+              <Button key={`approval-cancel-${call.id}`} label="취소" onPress={() => approve(call, 'cancel')} />
             </Box>
           )}
         </Box>
@@ -498,8 +539,9 @@ export const register: Register = on => {
     if (e.surface === 'mobile' || !('Input' in ui) || !('Select' in ui)) {
       return (
         <Box flexDirection="column">
-          <Text bold>변경 {list.length}개</Text>
-          {shown.map(f => (
+          <Text bold>{isUnchecked ? '변경 확인 보류' : `변경 ${list.length}개`}</Text>
+          {isUnchecked && <Text color="warning" wrap="wrap">{UNCHECKED_TEXT}</Text>}
+          {!isUnchecked && shown.map(f => (
             <Text>{fileLabel(f)}</Text>
           ))}
           {running.map(a => (
@@ -525,11 +567,12 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Text bold>변경 {list.length}개</Text>
+        <Text bold>{isUnchecked ? '변경 확인 보류' : `변경 ${list.length}개`}</Text>
         {!isFocused && <Text color="suggestion">조작하려면 패널을 클릭하거나 ctrl+x 후 tab</Text>}
-        {root === null && <Text dimColor>git 저장소가 아닙니다.</Text>}
-        {root !== null && list.length === 0 && <Text dimColor>변경된 파일 없음</Text>}
-        {shown.length > 0 && (
+        {root === null && !isUnchecked && <Text dimColor>git 저장소가 아닙니다.</Text>}
+        {isUnchecked && <Text color="warning" wrap="wrap">{UNCHECKED_TEXT}</Text>}
+        {root !== null && !isUnchecked && list.length === 0 && <Text dimColor>변경된 파일 없음</Text>}
+        {!isUnchecked && shown.length > 0 && (
           <Select
             key="files"
             options={shown.map(f => ({ value: f.path, label: fileLabel(f) }))}
@@ -538,7 +581,7 @@ export const register: Register = on => {
           />
         )}
         {list.length > MAX_FILES && <Text dimColor>외 {list.length - MAX_FILES}개</Text>}
-        {chosen && (
+        {!isUnchecked && chosen && (
           <Box flexDirection="column">
             <Box flexDirection="row" flexWrap="wrap">
               <Button key="open" hotkey="o" variant="primary" onPress={() => root && void openInEditor($, root, chosen.path)}>

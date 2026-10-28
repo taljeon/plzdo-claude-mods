@@ -16,7 +16,7 @@ export type CodexRun = { id: string; label: string; state: CodexState; updatedAt
 // A tool call that has not finished; `asked` once a permission dialog was put to the person, `hidden` once they dropped its row.
 export type Activity = { id: string; summary: string; startedAt: number; asked: boolean; hidden: boolean }
 export type Pin = { id: string; text: string; at: number }
-export type Approval = { id: string; decision: 'proceed' | 'cancel'; at: number }
+export type Approval = { id: string; decision: 'proceed' | 'cancel'; at: number; holdId?: string; command?: string }
 export type PermissionAsk = {
   id: string; tool: string; text: string; rule: string; agentId?: string; at: number
 }
@@ -28,6 +28,7 @@ declare module 'claude-code' {
       selected: string | null
       diff: string
       repo: string | null
+      unchecked: boolean
       agents: AgentRow[]
       codex: CodexRun[]
       activity: Activity[]

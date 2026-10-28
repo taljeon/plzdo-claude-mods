@@ -7,6 +7,7 @@ export type WaitingCall = { id: string; command: string; who: string; agentId?: 
 
 export type HeldCommand = {
   id: string
+  holdId?: string
   command: string
   agentId?: string
   /** Absent in held state saved by older plugin activations. */

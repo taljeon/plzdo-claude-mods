@@ -39,6 +39,7 @@ type Risk = {
   // Outside targets first written with a `..` segment: the OS follows a symlink before `..`, and the
   // folded path cannot show where that lands, so these are never treated as trusted.
   dotted?: string[]
+  unresolved?: boolean
   // An earlier part of the command moves, copies or re-globs files (`mv a.pdf .env && rm .env`),
   // so a preview taken now may not show what the rm will meet.
   isAfterChange?: boolean
@@ -183,6 +184,59 @@ export function classifyFileTool(file: FileTarget, context?: ProjectContext): Ri
   return combineRisks(risks)
 }
 
+async function realFileTarget($: EngineInterface, abs: string): Promise<string | undefined> {
+  let current = abs
+  const tail: string[] = []
+  for (;;) {
+    try {
+      const stat = await $.fs.stat(current, { resolve: true })
+      // The host folds stat request paths; a link before .. cannot be verified through it.
+      if (DOTDOT.test(abs)) return undefined
+      if (!stat.realPath?.startsWith('/') || (tail.length > 0 && stat.kind !== 'dir')) return undefined
+      return [stat.realPath.replace(/\/$/, ''), ...tail].join('/') || '/'
+    } catch (error) {
+      const missing = error !== null && typeof error === 'object'
+        && (('code' in error && error.code === 'ENOENT')
+          || ('message' in error && typeof error.message === 'string' && /\bENOENT\b/.test(error.message)))
+      // Folding .. before following a link would describe a different OS target.
+      if (!missing || DOTDOT.test(abs) || current === '/') return undefined
+      const slash = current.lastIndexOf('/')
+      tail.unshift(current.slice(slash + 1))
+      current = current.slice(0, slash) || '/'
+    }
+  }
+}
+
+async function classifyResolvedFile($: EngineInterface, file: FileTarget, context?: ProjectContext): Promise<Risk | null> {
+  const typed = classifyFileTool(file, context)
+  const risks = typed ? [typed, ...(typed.also ?? [])].map(({ also, ...risk }) => risk) : []
+  const abs = file.path.startsWith('/') ? file.path : context ? `${context.cwd}/${file.path}` : undefined
+  const real = abs === undefined ? undefined : await realFileTarget($, abs)
+  const reading = ['Read', 'Grep'].includes(file.tool)
+  if (real === undefined || (!reading && !context)) {
+    const target = abs ?? (file.path || file.glob || '(cwd)')
+    risks.push(reading
+      ? { risk: 'secret', targets: [target], action: '대상을 확인할 수 없음: read', unresolved: true }
+      : { risk: 'outside', root: context?.root, targets: [target], dotted: [target], unresolved: true })
+  } else {
+    const path = normalizePath(real)
+    if (isSecretName(path.slice(path.lastIndexOf('/') + 1), true) && !risks.some(risk => risk.targets?.includes(real))) {
+      risks.unshift({ risk: 'secret', targets: [real], action: reading ? 'read' : 'edit' })
+    }
+    if (!reading && context && outside(path, context) && !risks.some(risk => risk.risk === 'outside' && risk.targets?.includes(real))) {
+      risks.push({ risk: 'outside', root: context.root, targets: [real], ...(DOTDOT.test(file.path) ? { dotted: [real] } : {}) })
+    }
+    // Show the resolved target even when only the typed name caused the hold.
+    if (risks.length > 0 && abs !== real) {
+      for (const risk of risks) {
+        if (!risk.targets?.includes(real)) risk.targets = [...(risk.targets ?? []), real]
+        if (DOTDOT.test(file.path) && risk.risk === 'outside') risk.dotted = risk.targets
+      }
+    }
+  }
+  return combineRisks(risks)
+}
+
 type GlobChar = { star: boolean; literal?: string; test: (c: string) => boolean }
 function globChars(pattern: string): GlobChar[] {
   const chars: GlobChar[] = []
@@ -255,10 +309,11 @@ function combineRisks(risks: Risk[]): Risk | null {
   return rest.length > 0 ? { ...first, also: rest } : first
 }
 
-type HoldQueue = { holder: string | null; decisions: Map<string, 'proceed' | 'cancel'>; timeoutSeconds: number }
-type WorkbenchApproval = { id: string; decision: 'proceed' | 'cancel'; at: number }
+type HoldQueue = { holder: string | null; holdId?: string; decisions: Map<string, 'proceed' | 'cancel'>; timeoutSeconds: number }
+type WorkbenchApproval = { id: string; decision: 'proceed' | 'cancel'; at: number; holdId?: string; command?: string }
+let holdCounter = 0
 
-async function workbenchDecision($: EngineInterface, id: string): Promise<'proceed' | 'cancel' | undefined> {
+async function workbenchDecision($: EngineInterface, one: HeldCommand): Promise<'proceed' | 'cancel' | undefined> {
   try {
     // Workbench is optional: a local read type avoids a dependency back to its pane.
     const { value } = await ($.state as {
@@ -270,7 +325,9 @@ async function workbenchDecision($: EngineInterface, id: string): Promise<'proce
       && 'id' in entry && typeof entry.id === 'string'
       && 'decision' in entry && (entry.decision === 'proceed' || entry.decision === 'cancel')
       && 'at' in entry && typeof entry.at === 'number' && Number.isFinite(entry.at))) return undefined
-    return entries.findLast(entry => entry.id === id)?.decision
+    const entry = entries.findLast(entry => entry.id === one.id)
+    if (entry?.decision === 'cancel') return 'cancel'
+    if (one.holdId && entry?.holdId === one.holdId && entry.command === one.command) return entry.decision
   } catch {
     // An absent or unreadable workbench must leave the existing hold controls working.
   }
@@ -291,7 +348,7 @@ async function hold(
   next: Pick<Next<'tool.call'>, 'signal'>,
   proceed: () => Promise<ToolCallResult>,
   preview: () => Promise<Measured>,
-  decide: (id: string, decision: 'proceed' | 'cancel') => void,
+  decide: (id: string, decision: 'proceed' | 'cancel', holdId?: string) => void,
 ): Promise<ToolCallResult> {
   // Nothing draws the session (a plain `claude -p` run): nobody can see the buttons, so refuse now.
   if ((await $.session.surfaces()).length === 0) {
@@ -315,27 +372,31 @@ async function hold(
       await $.process.run(['sleep', '0.25'])
     }
     queue.holder = call.id
+    queue.decisions.delete(call.id)
   } finally {
-    await removeWaiting().catch(() => {})
+    if (queue.holder !== call.id) await removeWaiting().catch(() => {})
   }
   let closed = false
   try {
     const measured = await preview()
     const one: HeldCommand = {
       ...call,
+      holdId: `${call.id}:${++holdCounter}`,
       who,
       ...measured,
       where: 'pane',
       secondsLeft: queue.timeoutSeconds > 0 ? queue.timeoutSeconds : null,
     }
+    queue.holdId = one.holdId
     await update($, held, () => one)
+    await removeWaiting()
     const checkApproval = async () => {
       if (queue.decisions.has(one.id)) return
-      const decision = await workbenchDecision($, one.id)
+      const decision = await workbenchDecision($, one)
       // A band press made while this read was in flight wins: it is the newer press.
-      if (decision && !queue.decisions.has(one.id)) decide(one.id, decision)
+      if (decision && !queue.decisions.has(one.id)) decide(one.id, decision, one.holdId)
     }
-    await checkApproval() // A decision made while waiting applies before the first sleep.
+    await checkApproval() // A waiting cancellation applies before the first sleep.
 
     const opened = await $.ui.open({ id: PANE, title: 'Blast Radius', focus: true })
     if (!opened.isPlaced) {
@@ -381,9 +442,11 @@ async function hold(
     }
   } finally {
     queue.decisions.delete(call.id)
+    await removeWaiting().catch(() => {})
     // If the hold failed partway, don't leave its command blocking the next call.
     await update($, held, h => (h && h.id === call.id ? null : h)).catch(() => {})
     if (!closed) await $.ui.close({ id: PANE }).catch(() => {})
+    queue.holdId = undefined
     queue.holder = null
     await removeWaiting().catch(() => {})
   }
@@ -423,15 +486,16 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: ['Read', 'Edit', 'Write', 'NotebookEdit', 'Grep'] }, async ($, e, next) => {
     const file = fileTarget(e)
     if (!file) return next(e)
-    const context = ['Read', 'Grep'].includes(file.tool) ? undefined : await projectContext($)
-    const found = await relaxTrustedOutside($, classifyFileTool(file, context), trustedFolders, context)
+    const context = await projectContext($)
+    const found = await relaxTrustedOutside($, await classifyResolvedFile($, file, context), trustedFolders, context)
     if (!found) return next(e)
     return hold($, queue, { id: e.tool_use_id, command: `${file.tool} ${file.path || file.glob}`, risk: found.risk, agentId: e.agentId }, next, () => next(e), () => measure($, found), decide)
   }).catch(($, e, next) => next.called ? next(e) : { deny: 'blast-radius: cancelled this command because the file protection failed. Ask the user to run it themselves.' })
 
   // The hook's loop picks the press up.
-  const decide = (id: string, decision: 'proceed' | 'cancel') => {
-    if (queue.holder === id) queue.decisions.set(id, decision) // a late press for a finished hold is dropped, not kept forever
+  const decide = (id: string, decision: 'proceed' | 'cancel', holdId?: string) => {
+    // Call ids can be reused; only the preview that owns this hold may proceed.
+    if (queue.holder === id && (decision === 'cancel' || (holdId !== undefined && holdId === queue.holdId))) queue.decisions.set(id, decision)
   }
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -455,7 +519,7 @@ function report(
   e: Parameters<EngineInterface['ui']['resolve']>[0],
   one: HeldCommand,
   pending: WaitingCall[],
-  decide: (id: string, d: 'proceed' | 'cancel') => void,
+  decide: (id: string, d: 'proceed' | 'cancel', holdId?: string) => void,
   isCompact: boolean,
 ) {
   const { Box, Text, Button } = $.ui.resolve(e)
@@ -497,8 +561,8 @@ function report(
       <Text color="cyan" wrap="wrap">버튼을 클릭해서 고르세요. workbench 에이전트 탭에서도 고를 수 있어요.</Text>
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
         {/* No hotkeys: a key typed into the prompt must never answer a hold. A click or Tab and Enter presses. */}
-        <Button key="proceed" label={go} onPress={() => decide(one.id, 'proceed')} />
-        <Button key="cancel" label="취소" variant="primary" autoFocus onPress={() => decide(one.id, 'cancel')} />
+        <Button key="proceed" label={go} onPress={() => decide(one.id, 'proceed', one.holdId)} />
+        <Button key="cancel" label="취소" variant="primary" autoFocus onPress={() => decide(one.id, 'cancel', one.holdId)} />
         {one.secondsLeft != null && (
           <Text key="countdown" wrap="wrap" color={one.secondsLeft <= 10 ? 'yellow' : undefined} dimColor={one.secondsLeft > 10}>
             {`${one.secondsLeft}초 후 자동 취소`}
@@ -1122,9 +1186,9 @@ async function measureOne($: EngineInterface, found: Risk): Promise<Measured> {
     const names = [...new Set(paths.map(p => p.slice(p.lastIndexOf('/') + 1)))]
     return measurement(
       found.risk === 'secret' ? `${found.action ?? 'read/edit'} secret file: ${paths.join(', ')}` : `write outside the project (${found.root}): ${paths.join(', ')}`,
-      found.risk === 'secret' ? `비밀 파일 ${paths.length}개 접근` : `프로젝트 밖에 쓰기 ${paths.length}곳`,
-      await Promise.all(paths.map(path => previewPath($, path))),
-      [{ level: found.risk === 'secret' ? 'high' : 'mid', text: found.risk === 'secret' ? `비밀키·환경변수 파일 접근: ${names.join(', ')}` : `프로젝트 밖: ${paths.join(', ')}`,
+      found.unresolved ? '대상을 확인할 수 없어 보류함' : found.risk === 'secret' ? `비밀 파일 ${paths.length}개 접근` : `프로젝트 밖에 쓰기 ${paths.length}곳`,
+      found.unresolved ? paths.map(path => ({ text: `확인 못 함  ${path}` })) : await Promise.all(paths.map(path => previewPath($, path))),
+      [{ level: found.risk === 'secret' ? 'high' : 'mid', text: found.unresolved ? `대상을 확인할 수 없음: ${paths.join(', ')}` : found.risk === 'secret' ? `비밀키·환경변수 파일 접근: ${names.join(', ')}` : `프로젝트 밖: ${paths.join(', ')}`,
         ...(paths.length > 1 ? { uiText: found.risk === 'secret' ? '비밀키·환경변수 파일 접근' : '프로젝트 밖 쓰기' } : {}) }],
     )
   }

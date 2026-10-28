@@ -20,6 +20,7 @@ function engine(on: any, ran: string[], {
   previewOutput = undefined as string | undefined, rootExitCode = 0, previewExitCode = 0, queried = [] as string[],
   failOpen = undefined as (() => boolean) | undefined, failContext = false, realCwd = undefined as string | undefined,
   fileMetadata = {} as Record<string, string>, contents = {} as Record<string, string>, contentReads = [] as string[],
+  statRequests = [] as string[], statKinds = {} as Record<string, 'file' | 'dir' | 'other'>,
   statPaths = {} as Record<string, string | undefined>, statErrors = {} as Record<string, string>,
   agents = [] as { id: string; type: string; name?: string }[], failAgents = false,
 } = {}) {
@@ -27,12 +28,13 @@ function engine(on: any, ran: string[], {
   on('env.get', (_$: any, e: any) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
   on('session.cwd', () => { if (failContext) throw new Error('cwd unavailable'); return { value: cwd } })
   on('fs.stat', (_$: any, e: any) => {
+    statRequests.push(e.path)
     if (e.path in statErrors) return { deny: statErrors[e.path] }
     const known = { '/': '/', '/home/me/.claude': '/home/me/.claude', '/home/me/.codex': '/home/me/.codex', '/home/me/.agents': '/home/me/.agents',
       ...(realCwd ? { [cwd]: realCwd } : {}), ...statPaths }
     if (!(e.path in known)) return { deny: `ENOENT: ${e.path}` }
     const realPath = known[e.path as keyof typeof known]
-    return { value: { kind: realPath === undefined ? 'other' : 'dir', size: 0, mtimeMs: 0, isLink: realPath !== e.path, realPath } }
+    return { value: { kind: statKinds[e.path] ?? (realPath === undefined ? 'other' : 'dir'), size: 0, mtimeMs: 0, isLink: realPath !== e.path, realPath } }
   })
   on('agent.list', () => {
     if (failAgents) return { deny: 'agents unavailable' }
@@ -119,7 +121,7 @@ describe('blast-radius', () => {
         return result
       })
       const ui = await heldPane($)
-      state.approvals = [{ id: state.held!.id, decision, at: 1 }]
+      state.approvals = [{ id: state.held!.id, holdId: state.held!.holdId, command: state.held!.command, decision, at: 1 }]
       for (let i = 0; i < 50 && !settled; i++) {
         await new Promise(done => (globalThis as any).setTimeout(done, 5))
       }
@@ -186,7 +188,7 @@ describe('blast-radius', () => {
     await ui.unmount()
   })
 
-  test('a workbench decision made while waiting resolves as soon as the call is held', async ($, on) => {
+  test('a workbench cancel made while waiting denies as soon as the call is held', async ($, on) => {
     const clock = mock.clock(on)
     const ran: string[] = []
     engine(on, ran, { clock, agents: [{ id: 'worker', type: 'Explore' }] })
@@ -204,7 +206,7 @@ describe('blast-radius', () => {
     const ui = await paneShowing($, /^대기 1개$/)
     const pending = state.waiting[0]!
     expect(pending.agentId).toBe('worker')
-    state.approvals = [{ id: pending.id, decision: 'proceed', at: 1 }]
+    state.approvals = [{ id: pending.id, decision: 'cancel', at: 1 }]
     await ui.press({ key: 'cancel' })
     await first
     for (let i = 0; i < 50 && !settled; i++) {
@@ -212,9 +214,9 @@ describe('blast-radius', () => {
     }
     const immediately = settled
     await clock.advance(60_000)
-    await second
+    expect(await second).toMatchObject({ deny: expect.stringMatching(/the user pressed Cancel/) })
     expect(immediately).toBe(true)
-    expect(ran).toEqual(['git push --force'])
+    expect(ran).toEqual([])
     await ui.unmount()
   })
 
@@ -829,19 +831,19 @@ describe('blast-radius', () => {
     const ran: string[] = []
     engine(on, ran, { surfaces: [], failContext: true })
     for (const input of [{ tool: 'Read', file_path: '/etc/x' }, { tool: 'Grep', path: '/etc', pattern: 'x' }, { tool: 'Write', file_path: '/etc/x', content: 'x' }, { tool: 'Bash', command: 'ls' }]) await $.tool.call(input as any)
-    for (const input of [{ tool: 'Read', file_path: '/project/.env' }, { tool: 'Grep', glob: '.env*', pattern: 'x' }, { tool: 'Write', file_path: '/etc/.env', content: 'x' }, { tool: 'Bash', command: 'rm -rf build' }, { tool: 'Bash', command: 'cat .env' }, { tool: 'Bash', command: 'git push -f' }, { tool: 'Bash', command: 'prisma migrate deploy' }]) {
+    for (const input of [{ tool: 'Write', file_path: '/etc/x', content: 'x' }, { tool: 'Read', file_path: '/project/.env' }, { tool: 'Grep', glob: '.env*', pattern: 'x' }, { tool: 'Write', file_path: '/etc/.env', content: 'x' }, { tool: 'Bash', command: 'rm -rf build' }, { tool: 'Bash', command: 'cat .env' }, { tool: 'Bash', command: 'git push -f' }, { tool: 'Bash', command: 'prisma migrate deploy' }]) {
       expect(((await $.tool.call(input as any)) as any).deny).toMatch(/no screen/)
     }
-    expect(ran).toEqual(['Read', 'Grep', 'Write', 'ls'])
+    expect(ran).toEqual(['Read', 'Grep', 'ls'])
   })
 
-  test('read tools and Bash without rm or mv never query project context', async ($, on) => {
+  test('native reads query context for real targets; unrelated Bash stays context-free', async ($, on) => {
     const queried: string[] = []
     engine(on, [], { surfaces: [], queried })
     for (const input of [{ tool: 'Read', file_path: '/etc/x' }, { tool: 'Grep', glob: '.env', pattern: 'x' }, { tool: 'Bash', command: 'cat .env' }, { tool: 'Bash', command: 'touch /etc/x' }]) await $.tool.call(input as any)
-    expect(queried).toEqual([])
+    expect(queried).toEqual(['/project', '/project'])
     await $.tool.call({ tool: 'Bash', command: 'mv a /etc/x' } as any)
-    expect(queried).toEqual(['/project'])
+    expect(queried).toEqual(['/project', '/project', '/project'])
   })
 
   test('a symlinked session subfolder accepts writes under either spelling of its project', async ($, on) => {
@@ -1563,3 +1565,230 @@ describe('blast-radius', () => {
   })
 })
 
+
+describe('F3 native real targets', () => {
+  for (const [label, tool, path, statPaths, statErrors, statKinds, message] of [
+    ['directory link', 'Write', '/project/link/x', { '/project/link/x': '/elsewhere/x' }, {}, {}, /write outside.*\/elsewhere\/x/],
+    ['secret link', 'Read', '/project/notes.txt', { '/project/notes.txt': '/project/.env' }, {}, {}, /secret file.*\/project\/\.env/],
+    ['new file under linked parent', 'Write', '/project/link/new/deep/x', { '/project/link': '/elsewhere' }, {}, {}, /write outside.*\/elsewhere\/new\/deep\/x/],
+    ['dangling write', 'Write', '/project/link', { '/project/link': undefined }, {}, {}, /write outside/],
+    ['dangling read', 'Read', '/project/link', { '/project/link': undefined }, {}, {}, /대상을 확인할 수 없음/],
+    ['denied write', 'Write', '/project/x', {}, { '/project/x': 'EACCES' }, {}, /write outside/],
+    ['denied grep', 'Grep', '/project/x', {}, { '/project/x': 'ELOOP' }, {}, /대상을 확인할 수 없음/],
+    ['non-directory ancestor', 'Write', '/project/file/x', { '/project/file': '/project/file' }, {}, { '/project/file': 'file' }, /write outside/],
+    ['missing dotted path', 'Write', '/project/new/../x', {}, {}, {}, /write outside/],
+    ['host-folded dotdot stays unverified', 'Write', '/project/link/../x', { '/project/x': '/project/x' }, {}, {}, /write outside/],
+    ['unresolved trusted link', 'Write', '/home/me/.claude/link', { '/home/me/.claude/link': undefined }, {}, {}, /write outside/],
+  ] as const) {
+    test(label, async ($, on) => {
+      const ran: string[] = []
+      const statRequests: string[] = []
+      engine(on, ran, { surfaces: [], statPaths, statErrors, statKinds, statRequests })
+      const input = tool === 'Grep' ? { tool, path, pattern: 'x' } : { tool, file_path: path, content: 'x' }
+      const result = await $.tool.call(input as any)
+      if (label === 'host-folded dotdot stays unverified') expect(statRequests[0]).toBe('/project/x')
+      expect(result).toMatchObject({ deny: expect.stringMatching(message) })
+      expect(ran).toEqual([])
+    })
+  }
+
+  for (const tool of ['Write', 'Edit', 'NotebookEdit'] as const) {
+    test(`missing context holds absolute ${tool} even in trusted folders`, async ($, on) => {
+      const ran: string[] = []
+      engine(on, ran, { surfaces: [], failContext: true })
+      for (const path of ['/outside/file', '/home/me/.claude/file']) {
+        const input = tool === 'NotebookEdit' ? { tool, notebook_path: path, new_source: 'x' }
+          : { tool, file_path: path, content: 'x', old_string: 'x', new_string: 'y' }
+        expect(await $.tool.call(input as any)).toMatchObject({ deny: expect.stringMatching(/write outside/) })
+      }
+      expect(ran).toEqual([])
+    })
+  }
+
+  test('missing context still permits a normal absolute Read and holds a secret Read', async ($, on) => {
+    const ran: string[] = []
+    engine(on, ran, { surfaces: [], failContext: true })
+    expect((await $.tool.call({ tool: 'Read', file_path: '/outside/file' }) as any).deny).toBeUndefined()
+    expect(await $.tool.call({ tool: 'Read', file_path: '/outside/.env' })).toMatchObject({ deny: expect.stringMatching(/secret file/) })
+    expect(ran).toEqual(['Read'])
+  })
+
+  test('ordinary existing and missing native files, relative paths and default Grep remain unheld', async ($, on) => {
+    const ran: string[] = []
+    engine(on, ran, { surfaces: [], statPaths: { '/project': '/project', '/project/existing': '/project/existing' }, statKinds: { '/project/existing': 'file' } })
+    for (const tool of ['Read', 'Edit', 'Write']) {
+      for (const path of ['/project/existing', '/project/new/deep/file', 'relative.txt']) {
+        expect((await $.tool.call({ tool, file_path: path, content: 'x', old_string: 'x', new_string: 'y' } as any) as any).deny).toBeUndefined()
+      }
+    }
+    expect((await $.tool.call({ tool: 'Grep', pattern: 'x', glob: '*.ts' } as any) as any).deny).toBeUndefined()
+    expect(ran.length).toBe(10)
+  })
+
+  test('an unresolved read explains the hold without reading a content preview', async ($, on) => {
+    const ran: string[] = []
+    const contentReads: string[] = []
+    engine(on, ran, { statPaths: { '/project/link': undefined }, contentReads })
+    const call = $.tool.call({ tool: 'Read', file_path: '/project/link' })
+    const ui = await paneShowing($, /대상을 확인할 수 없음/)
+    expect(await ui.find({ type: 'Text', text: '대상을 확인할 수 없어 보류함' })).toBeDefined()
+    await ui.press({ key: 'cancel' })
+    await call
+    expect(contentReads).toEqual([])
+    expect(ran).toEqual([])
+    await ui.unmount()
+  })
+
+  test('a project link into a real trusted folder remains unheld', async ($, on) => {
+    const ran: string[] = []
+    engine(on, ran, { surfaces: [], statPaths: { '/project/link': '/home/me/.claude', '/project/link/existing': '/home/me/.claude/existing' } })
+    for (const path of ['/project/link/existing', '/project/link/new/x']) {
+      expect((await $.tool.call({ tool: 'Write', file_path: path, content: 'x' }) as any).deny).toBeUndefined()
+    }
+    expect(ran).toEqual(['Write', 'Write'])
+  })
+})
+
+describe('F4 preview-bound approvals', () => {
+  for (const component of ['Pane', 'AbovePrompt'] as const) {
+    test(`stale ${component} proceed cannot approve a new hold with the same call id`, async ($, on) => {
+      const ran: string[] = []
+      engine(on, ran)
+      const state = workbenchApprovals(on)
+      let rendered: HeldCommand | undefined
+      // The kit redraws on press; freeze A's snapshot to exercise its stale button.
+      on('state.get', { plugin: 'blast-radius', key: 'held' }, ($, e, next) => rendered
+        ? { value: { value: rendered, version: 1 } } : next(e))
+      const input = { tool: 'Bash' as const, tool_use_id: 'reused-button', command: 'git push --force' }
+      const first = $.tool.call(input)
+      const initial = await heldPane($)
+      const old = { ...state.held! }
+      await initial.press({ key: 'cancel' })
+      await first
+      await initial.unmount()
+      const command = 'git push --force origin other'
+      const second = $.tool.call({ ...input, command })
+      const current = await paneShowing($, /git push --force origin other/)
+      expect(state.held?.holdId).not.toBe(old.holdId)
+      await current.unmount()
+      rendered = old
+      const stale = await $.ui.mount({ plugin: 'blast-radius', surface: 'terminal',
+        ...(component === 'Pane' ? PANE : { component, props: { hasSurvey: false } }) } as any)
+      expect(await stale.find({ type: 'Text', text: old.command })).toBeDefined()
+      await stale.press({ key: 'proceed' })
+      await stale.unmount()
+      rendered = undefined
+      await new Promise(done => (globalThis as any).setTimeout(done, 40))
+      const ranEarly = [...ran]
+      const stillHeld = state.held?.command === command
+      if (stillHeld) {
+        const fresh = await heldPane($)
+        await fresh.press({ key: 'proceed' })
+        await fresh.unmount()
+      }
+      await second
+      expect(ranEarly).toEqual([])
+      expect(stillHeld).toBe(true)
+      expect(ran).toEqual([command])
+    })
+  }
+
+  test('a rendered legacy hold without a token cannot proceed but can cancel', async ($, on) => {
+    const ran: string[] = []
+    engine(on, ran)
+    const state = workbenchApprovals(on)
+    let legacy = false
+    on('state.get', { plugin: 'blast-radius', key: 'held' }, ($, e, next) => legacy && state.held
+      ? { value: { value: { ...state.held, holdId: undefined }, version: 1 } } : next(e))
+    const call = $.tool.call({ tool: 'Bash', command: 'git push --force' })
+    const initial = await heldPane($)
+    await initial.unmount()
+    legacy = true
+    const ui = await heldPane($)
+    await ui.press({ key: 'proceed' })
+    await new Promise(done => (globalThis as any).setTimeout(done, 40))
+    const stillHeld = state.held !== null
+    if (stillHeld) await ui.press({ key: 'cancel' })
+    await call
+    expect(stillHeld).toBe(true)
+    expect(ran).toEqual([])
+    await ui.unmount()
+  })
+
+  for (const stale of ['missing token', 'earlier token', 'different command']) {
+    test(`proceed with ${stale} waits for a current preview press`, async ($, on) => {
+      const ran: string[] = []
+      engine(on, ran)
+      const state = workbenchApprovals(on)
+      const command = `echo ${'x'.repeat(120)}; git push --force`
+      const call = $.tool.call({ tool: 'Bash', command })
+      const ui = await heldPane($)
+      const one = state.held!
+      state.approvals = [{ id: one.id, decision: 'proceed', at: 1,
+        ...(stale === 'missing token' ? {} : { holdId: stale === 'earlier token' ? 'earlier' : one.holdId, command: stale === 'different command' ? 'echo safe' : command }) }]
+      await new Promise(done => (globalThis as any).setTimeout(done, 40))
+      const wasHeld = state.held !== null
+      const ranEarly = [...ran]
+      state.approvals = [{ id: one.id, decision: 'proceed', holdId: one.holdId, command, at: 2 }]
+      await call
+      expect(wasHeld).toBe(true)
+      expect(ranEarly).toEqual([])
+      expect(ran).toEqual([command])
+      await ui.unmount()
+    })
+  }
+
+  test('a crafted waiting proceed without a token cannot pre-approve the long command', async ($, on) => {
+    const ran: string[] = []
+    engine(on, ran)
+    const state = workbenchApprovals(on)
+    const first = $.tool.call({ tool: 'Bash', command: 'git push --force' })
+    const initial = await heldPane($)
+    await initial.unmount()
+    const command = `echo ${'x'.repeat(120)}; git push --force`
+    const second = $.tool.call({ tool: 'Bash', command })
+    const ui = await paneShowing($, /^대기 1개$/)
+    state.approvals = [{ id: state.waiting[0]!.id, decision: 'proceed', at: 1 }]
+    await ui.press({ key: 'cancel' })
+    await first
+    await new Promise(done => (globalThis as any).setTimeout(done, 60))
+    const stillHeld = state.held?.command === command
+    const ranEarly = [...ran]
+    if (state.held) state.approvals = [{ id: state.held.id, decision: 'cancel', at: 2 }]
+    await second
+    expect(stillHeld).toBe(true)
+    expect(ranEarly).toEqual([])
+    await ui.unmount()
+  })
+
+  test('timeout and cancellation cannot reuse a proceed on another hold of the same id', async ($, on) => {
+    const clock = mock.clock(on)
+    const ran: string[] = []
+    engine(on, ran, { clock })
+    const state = workbenchApprovals(on)
+    const input = { tool: 'Bash' as const, tool_use_id: 'reused', command: 'git push --force' }
+    const first = $.tool.call(input)
+    const ui = await heldPane($)
+    const old = state.held!
+    await clock.advance(60_000)
+    expect(await first).toMatchObject({ deny: expect.stringMatching(/nobody answered/) })
+    state.approvals = [{ id: old.id, decision: 'proceed', holdId: old.holdId, command: old.command, at: 1 }]
+    const second = $.tool.call(input)
+    await new Promise(done => (globalThis as any).setTimeout(done, 60))
+    const current = state.held
+    if (current) state.approvals = [{ id: current.id, decision: 'cancel', at: 2 }]
+    await second
+    expect(current?.id).toBe(old.id)
+    expect(current?.holdId).not.toBe(old.holdId)
+    state.approvals = [{ id: current!.id, decision: 'proceed', holdId: current!.holdId, command: current!.command, at: 3 }]
+    const third = $.tool.call(input)
+    await new Promise(done => (globalThis as any).setTimeout(done, 60))
+    const afterCancel = state.held
+    if (afterCancel) state.approvals = [{ id: afterCancel.id, decision: 'cancel', at: 4 }]
+    await third
+    expect(afterCancel?.holdId).toBeDefined()
+    expect(afterCancel?.holdId).not.toBe(current?.holdId)
+    expect(ran).toEqual([])
+    await ui.unmount()
+  })
+})

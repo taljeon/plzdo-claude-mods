@@ -1,6 +1,6 @@
 {
   "name": "blast-radius",
-  "version": "0.3.0-ta.4",
+  "version": "0.3.0-ta.5",
   "description": "Holds risky Bash commands, secret file access, and rm/mv or file-tool writes outside the project, showing secrets, repos, uncommitted work and file dates before they run. Fork of hamzafer/claude-code-mods.",
   "author": {
     "name": "Hamza Zafar",
